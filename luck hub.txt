@@ -1,0 +1,2092 @@
+-- ==============================================================================
+-- LUCKY HUB (FIXED EDITION)
+-- แก้ไข: syntax error, ตรรกะเควสต์, อ่านเลเวล >= 1000, resume จาก config,
+--        modal รั่ว, ลูปซ้อน, รันซ้ำ, ปุ่มลอย, save ถี่, เลือกมอนใกล้สุด ฯลฯ
+-- ==============================================================================
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local StarterGui = game:GetService("StarterGui")
+local HttpService = game:GetService("HttpService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- ==============================================================================
+-- PART 0: Runtime / Cleanup (กันลูปและ connection ซ้อนเมื่อรันสคริปต์ซ้ำ)
+-- ==============================================================================
+
+local env = (getgenv and getgenv()) or _G
+if env.LuckyHubCleanup then pcall(env.LuckyHubCleanup) end
+
+local Runtime = { alive = true }
+local Connections = {}
+local ScreenGui -- กำหนดค่าใน Part 3
+
+local function track(conn)
+    table.insert(Connections, conn)
+    return conn
+end
+
+env.LuckyHubCleanup = function()
+    if Runtime.flush then pcall(Runtime.flush) end -- เซฟค่าล่าสุดก่อนปิด
+    Runtime.alive = false
+    for _, c in ipairs(Connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(Connections)
+    if ScreenGui then pcall(function() ScreenGui:Destroy() end) end
+end
+
+local function notify(title, text, duration)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", { Title = title, Text = text, Duration = duration or 3 })
+    end)
+end
+
+-- ==============================================================================
+-- PART 1: Remotes, Config, Data
+-- ==============================================================================
+
+local EnemiesFolder = workspace:WaitForChild("Enemies", 10)
+local Remotes = ReplicatedStorage:WaitForChild("WK_Remotes", 10)
+local missingRemotes = {}
+
+local function getRemote(name)
+    local remote = Remotes and (Remotes:FindFirstChild(name) or Remotes:WaitForChild(name, 2))
+    if not remote then table.insert(missingRemotes, name) end
+    return remote
+end
+
+local BasicAttackEvent = getRemote("BasicAttack")
+local AcceptQuest = getRemote("AcceptQuest")
+local TeleportRemote = getRemote("TeleportSelect")
+local ShopSpinRemote = getRemote("ShopSpin")
+local DropGrimoireRemote = getRemote("DropGrimoire")
+local MaterialShopBuyRemote = getRemote("MaterialShopBuy")
+local MaterialShopStateRemote = getRemote("MaterialShopState")
+local CastSkillRemote = getRemote("CastSkill")
+local CombatEquipmentRemote = getRemote("CombatEquipment")
+local AssignStatRemote = getRemote("AssignStatPoint")
+local SetBookModeRemote = getRemote("SetBookMode")
+local RerollRaceRemote = getRemote("RerollPlayerRace")
+local ChestOpenRemote = getRemote("ChestOpen")
+local PlayTimeClaimRemote = getRemote("PlayTimeClaim")
+local ClaimAssignmentRemote = getRemote("ClaimAssignment")
+local BossSummonRemote = getRemote("BossSummon")
+
+-- ยิง remote ได้ทั้ง RemoteEvent / RemoteFunction (ไม่ error ถ้าเป็นชนิดอื่น)
+local function fire(remote, ...)
+    if not remote then return false end
+    if remote:IsA("RemoteEvent") then
+        remote:FireServer(...)
+        return true
+    elseif remote:IsA("RemoteFunction") then
+        local args = table.pack(...)
+        task.spawn(function()
+            pcall(remote.InvokeServer, remote, table.unpack(args, 1, args.n))
+        end)
+        return true
+    end
+    return false
+end
+
+-- [[ CONFIG & AUTO-SAVE SYSTEM ]]
+local ConfigFileName = "LuckyHub_Config_" .. player.UserId .. ".json"
+local Settings = {
+    AutoFarmLevel = false,
+    FarmSelected = false,
+    SelectedMonster = "None",
+    SelectedIsland = "STARTER_ISLAND",
+    AttackDistance = 5,
+    HeightMode = "Above",
+    HeightOffset = 6,
+
+    AutoSpinGrimoire = false,
+    AutoDropGrimoire = false,
+    KeepRarity = "Legendary+",
+
+    AutoBuyMats = false,
+    SelectedMaterial = "BoarMeat",
+    BuyAmount = 1,
+
+    AutoCollect = false,
+    CollectRange = 80,
+    DebugLog = false,
+
+    AutoSkill = false,
+    SkillList = "DivineRain,LightPrison,LightSwords",
+    SkillInterval = 2,
+    AutoEquipMagic = false,
+    MinHpPercent = 0,
+    BossAddRadius = 150,
+
+    AutoStats = false,
+    StatChoice = "Melee",
+    StatAmount = 1,
+    AntiAfk = true,
+
+    AutoRerollRace = false, -- ใช้ไอเทมหมดไป จึงไม่เก็บสถานะ ON ข้ามการรัน (รีเซ็ตเป็น false ทุกครั้งหลังโหลด config)
+    RaceTargets = { Human = 0, Elf = 0, Dwarf = 0, Devil = 0, Angel = 0 }, -- 0 = ไม่เลือก, 1-3 = ระดับเผ่าขั้นต่ำที่ต้องการ
+    MaxRerolls = 200,
+
+    AutoOpenChests = false,
+    AutoClaimRewards = false,
+
+    AutoBoss = false, -- กินกุญแจ + Yul ทุกครั้ง จึงไม่เก็บสถานะ ON ข้ามการรัน
+    SummonBoss = "Yami Sukehiro",
+    SummonDifficulty = "Easy",
+    MaxSummons = 1,
+}
+
+-- debounce: รวมการเขียนไฟล์ให้เหลือครั้งเดียวต่อวินาที (กันเขียนถี่ตอนลาก slider)
+local function writeConfig()
+    if not writefile then return end
+    pcall(function()
+        writefile(ConfigFileName, HttpService:JSONEncode(Settings))
+    end)
+end
+Runtime.flush = writeConfig
+
+local saveQueued = false
+local function saveConfig()
+    if not writefile or saveQueued then return end
+    saveQueued = true
+    task.delay(1, function()
+        saveQueued = false
+        if Runtime.alive then writeConfig() end -- instance เก่าที่ถูก cleanup แล้วห้ามเขียนทับ
+    end)
+end
+
+local function loadConfig()
+    if not (readfile and isfile and isfile(ConfigFileName)) then return end
+    pcall(function()
+        local data = HttpService:JSONDecode(readfile(ConfigFileName))
+        for k, v in pairs(data) do
+            -- รับเฉพาะ key ที่มีอยู่ และชนิดข้อมูลตรงกัน (กันไฟล์เสีย)
+            if Settings[k] ~= nil and type(v) == type(Settings[k]) then
+                Settings[k] = v
+            end
+        end
+    end)
+    Settings.AttackDistance = math.clamp(Settings.AttackDistance, 0, 15)
+    Settings.HeightOffset = math.clamp(Settings.HeightOffset, 1, 25)
+    Settings.BuyAmount = math.clamp(Settings.BuyAmount, 1, 50)
+    Settings.CollectRange = math.clamp(Settings.CollectRange, 10, 300)
+    Settings.SkillInterval = math.clamp(Settings.SkillInterval, 1, 10)
+    Settings.MinHpPercent = math.clamp(Settings.MinHpPercent, 0, 90)
+    Settings.BossAddRadius = math.clamp(Settings.BossAddRadius, 30, 400)
+    Settings.StatAmount = math.clamp(Settings.StatAmount, 1, 10)
+    Settings.MaxRerolls = math.clamp(Settings.MaxRerolls, 1, 500)
+    Settings.MaxSummons = math.clamp(Settings.MaxSummons, 1, 20)
+    if Settings.HeightMode ~= "Above" and Settings.HeightMode ~= "Below" then
+        Settings.HeightMode = "Above"
+    end
+    -- ฟาร์มสองโหมดพร้อมกันไม่ได้
+    if Settings.AutoFarmLevel and Settings.FarmSelected then
+        Settings.FarmSelected = false
+    end
+end
+loadConfig()
+Settings.AutoRerollRace = false -- ฟีเจอร์ที่กินไอเทม ต้องเปิดเองทุกครั้ง
+Settings.AutoBoss = false
+
+-- [[ GAME DATA TABLES ]]
+local RarityTiers = {
+    Common = { "Wind", "Fire" },
+    Rare = { "Water", "Earth", "Lightning", "Chain", "Poison" },
+    Legendary = { "Dark", "Light", "Plant", "WorldTree" },
+    Mythical = { "AntiMagic", "Star" },
+}
+local TierOrder = { "Common", "Rare", "Legendary", "Mythical" }
+-- ค่า = ลำดับ tier ต่ำสุดที่ "เก็บไว้" (tier ที่ต่ำกว่าจะถูกทิ้ง)
+local KeepTierIndex = { ["Rare+"] = 2, ["Legendary+"] = 3, ["Mythical Only"] = 4 }
+
+-- ชื่อสเตตัสที่เกมใช้กับ AssignStatPoint (ยืนยันจากล็อก remote spy)
+local StatList = { "Melee", "Defense", "Magic", "ManaCapacity" }
+if not table.find(StatList, Settings.StatChoice) then Settings.StatChoice = "Melee" end
+
+-- บอสที่เรียกได้จาก BossSummonUI (ข้อมูลจาก Config.BossSummon)
+--   id      = ค่า BossId ที่ส่งใน BossSummon
+--   enemyId = attribute EnemyId ของมอนที่โผล่ใน Workspace.Enemies
+local SummonBosses = {
+    { label = "Yami Sukehiro", id = "YamiSukehiro", enemyId = "YamiSukehiro" },
+    { label = "Fuegoleon Vermillion", id = "FuegoleonVermillion", enemyId = "FuegoleonBoss" },
+}
+local SummonBossLabels = {}
+for _, b in ipairs(SummonBosses) do table.insert(SummonBossLabels, b.label) end
+local DifficultyList = { "Easy", "Medium", "Hard", "Extreme" } -- Easy = ปุ่ม "Normal" บนหน้าจอ
+
+-- ข้อมูลเผ่าจาก Config.PlayerRaces: odds = โอกาสสุ่มได้เผ่านั้นต่อครั้ง (น้ำหนัก/1000), tiers = ชื่อระดับ 1-3
+local RaceList = { "Human", "Elf", "Dwarf", "Devil", "Angel" }
+local RaceData = {
+    Human = { odds = 70, theme = "XP", tiers = { "Human", "Noble Human", "Arcane Human" } },
+    Elf   = { odds = 15, theme = "มานา / คูลดาวน์", tiers = { "Half-Elf", "Elf", "High Elf" } },
+    Dwarf = { odds = 9,  theme = "ดรอปหีบ / เลือด", tiers = { "Half-Dwarf", "Dwarf", "Forge Dwarf" } },
+    Devil = { odds = 4,  theme = "ดาเมจ / คริ", tiers = { "Devil-Touched", "Half-Devil", "True Devil" } },
+    Angel = { odds = 2,  theme = "ฟื้นเลือด / ความเร็ว", tiers = { "Demi-Angel", "Angel", "Seraph" } },
+}
+-- โอกาสที่ระดับ (Stage) จะ >= ค่านั้น: Stage 1/2/3 น้ำหนัก 700/250/50
+local StageAtLeast = { [1] = 1, [2] = 0.30, [3] = 0.05 }
+do -- ตรวจค่าเป้าหมายเผ่าที่โหลดมาให้อยู่ในช่วง 0-3
+    local targets = Settings.RaceTargets
+    for _, race in ipairs(RaceList) do
+        targets[race] = math.clamp(math.floor(tonumber(targets[race]) or 0), 0, 3)
+    end
+end
+if not table.find(SummonBossLabels, Settings.SummonBoss) then Settings.SummonBoss = SummonBossLabels[1] end
+if not table.find(DifficultyList, Settings.SummonDifficulty) then Settings.SummonDifficulty = "Easy" end
+
+local IslandList = {
+    "STARTER_ISLAND", "SKULL_ISLAND", "JUNGLE_ISLAND", "POISON_ISLAND", "CASTLE_ISLAND", "ZOMBIE_ISLAND",
+}
+-- วัตถุดิบทั้งหมดที่หน้าร้าน (ShopUI > Page_Materials) มีขาย 15 ชนิด (ยืนยันจากไฟล์ dump)
+local MaterialList = {
+    "BoarMeat", "BlueHerb", "GreenHerb", "GoldenLeaf", "Honey", "ManaCrystal",
+    "ClearWater", "WildBerries", "EarthRoot", "GaleFeathers", "Honeycomb",
+    "StoneCrust", "WindSeeds", "AncientSap", "SpiritMoss",
+}
+
+local QuestTable = {
+    { max = 74,        quest = "STARTER_Ch1_Kill", mob = "NoMagicBandit",  island = "STARTER_ISLAND" },
+    { max = 159,       quest = "STARTER_Ch2_Boss", mob = "Barbarian King", island = "STARTER_ISLAND" },
+    { max = 249,       quest = "SKULL_Ch1_Kill",   mob = "Bandit",         island = "SKULL_ISLAND" },
+    { max = 379,       quest = "SKULL_Ch2_Boss",   mob = "RevchiBoss",     island = "SKULL_ISLAND" },
+    { max = 579,       quest = "JUNGLE_Ch1_Kill",  mob = "CorruptedBoar",  island = "JUNGLE_ISLAND" },
+    { max = 899,       quest = "JUNGLE_Ch2_Boss",  mob = "PumpkinKing",    island = "JUNGLE_ISLAND" },
+    { max = 1399,      quest = "POISON_Ch1_Kill",  mob = "PoisonBoar",     island = "POISON_ISLAND" },
+    { max = 2099,      quest = "POISON_Ch2_Boss",  mob = "VenomBoss",      island = "POISON_ISLAND" },
+    { max = 3249,      quest = "CASTLE_Ch1_Kill",  mob = "RoyalGuard",     island = "CASTLE_ISLAND" },
+    { max = 4999,      quest = "CASTLE_Ch2_Boss",  mob = "RoyalGuardBoss", island = "CASTLE_ISLAND" },
+    { max = math.huge, quest = "ZOMBIE_Ch1_Boss",  mob = "RadesBoss",      island = "ZOMBIE_ISLAND" },
+}
+
+local function getQuestForLevel(lv)
+    for _, q in ipairs(QuestTable) do
+        if lv <= q.max then return q end
+    end
+end
+
+local cachedLevel = 1
+local farmState = { lastIsland = "", lastAccept = 0, target = nil, acceptFails = 0, npcVisited = nil }
+local Status = { kills = 0, startTime = os.clock(), state = "Idle" } -- ใช้แสดงในแผงสถานะ
+
+-- [[ THEME PRESET ]]
+local UITheme = {
+    MainBg = Color3.fromRGB(15, 19, 26),
+    Sidebar = Color3.fromRGB(18, 24, 34),
+    Card = Color3.fromRGB(22, 29, 41),
+    CardActive = Color3.fromRGB(26, 36, 52),
+    Stroke = Color3.fromRGB(35, 46, 64),
+    Accent = Color3.fromRGB(56, 126, 245),
+    Text = Color3.fromRGB(240, 244, 250),
+    SubText = Color3.fromRGB(130, 144, 168),
+    ToggleOff = Color3.fromRGB(34, 44, 60),
+    Green = Color3.fromRGB(46, 204, 113),
+    Red = Color3.fromRGB(231, 76, 60),
+}
+
+-- ==============================================================================
+-- PART 2: Utility Functions
+-- ==============================================================================
+
+local function getHealth(monster)
+    if not monster then return 0 end
+    local hum = monster:FindFirstChildOfClass("Humanoid")
+    if hum then return hum.Health end
+    return monster:GetAttribute("Health") or 0
+end
+
+local function getMyHRP()
+    local char = player.Character
+    if not char then return nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return nil end
+    return char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getFarmPosition(targetHRP)
+    local height = (Settings.HeightMode == "Above") and Settings.HeightOffset or (-Settings.HeightOffset)
+    local dist = math.max(Settings.AttackDistance, 0.1)
+    local myPos = (targetHRP.CFrame * CFrame.new(0, height, dist)).Position
+    return myPos, targetHRP.Position
+end
+
+-- แคช Level label (ค้นหา recursive เฉพาะตอนยังไม่เจอ และไม่ถี่เกิน 3 วินาที)
+local levelLabel, lastLabelSearch = nil, 0
+local function updateLevel()
+    if not (levelLabel and levelLabel.Parent) then
+        if os.clock() - lastLabelSearch < 3 then return end
+        lastLabelSearch = os.clock()
+        -- ตำแหน่งจริงของ label เลเวล (ยืนยันจากไฟล์ dump): WK_HUD_Safe > Container > Identity Card > Level
+        local safe = playerGui:FindFirstChild("WK_HUD_Safe")
+        local container = safe and safe:FindFirstChild("Container")
+        local card = container and container:FindFirstChild("Identity Card")
+        local found = card and card:FindFirstChild("Level")
+        if not (found and found:IsA("TextLabel")) then
+            found = nil
+            -- สำรอง: ค้นทั้ง PlayerGui เผื่อเกมย้าย label
+            for _, d in ipairs(playerGui:GetDescendants()) do
+                if d.Name == "Level" and d:IsA("TextLabel") then found = d break end
+            end
+        end
+        if found then levelLabel = found else return end
+    end
+    -- ตัดเครื่องหมาย , ออกก่อน ("Lv. 1,234" -> 1234)
+    local digits = (levelLabel.Text:gsub(",", "")):match("%d+")
+    local parsed = tonumber(digits)
+    if parsed then cachedLevel = parsed end
+end
+
+local function checkQuestActive()
+    if player:GetAttribute("WK_QuestMarkerOn") == true then return true end
+
+    local hud = playerGui:FindFirstChild("WK_HUD")
+    if hud then
+        local rightCol = hud:FindFirstChild("Right Column")
+        local qCard = rightCol and rightCol:FindFirstChild("Quest Card")
+        if qCard and qCard.Visible == true then
+            local canvas = qCard:FindFirstChildOfClass("CanvasGroup")
+            if canvas and canvas.GroupTransparency >= 0.9 then
+                return false
+            end
+            return true
+        end
+    end
+    return false
+end
+
+-- ล็อกความเร็ว + ปิด Collision (NoClip) ระหว่างฟาร์ม
+track(RunService.Stepped:Connect(function()
+    if not (Settings.AutoFarmLevel or Settings.FarmSelected or Settings.AutoBoss) then return end
+    local char = player.Character
+    if not char then return end
+    for _, part in ipairs(char:GetChildren()) do
+        if part:IsA("BasePart") and part.CanCollide then
+            part.CanCollide = false
+        end
+    end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end
+end))
+
+-- ตายแล้วเกิดใหม่ อาจอยู่คนละเกาะ -> ให้ลูปฟาร์มวาร์ปใหม่
+track(player.CharacterAdded:Connect(function()
+    farmState.lastIsland = ""
+end))
+
+-- เกมส่ง QuestCompleted มาเมื่อเควสต์เสร็จ -> ปลดล็อกเป้าหมายและรับเควสต์ใหม่ทันที
+-- (ไม่ต้องรอ UI ค่อยๆ หายไป; ไม่ต้องรู้ข้อมูลที่ส่งมา)
+do
+    local ev = Remotes and Remotes:FindFirstChild("QuestCompleted")
+    if ev and ev:IsA("RemoteEvent") then
+        track(ev.OnClientEvent:Connect(function()
+            farmState.target = nil
+            farmState.lastAccept = 0
+            farmState.acceptFails = 0
+            farmState.npcVisited = nil
+        end))
+    end
+end
+
+-- รายชื่อมอนสเตอร์ (เพิ่มเฉพาะตัวที่เพิ่งเกิด ไม่วนทั้ง folder ซ้ำ)
+local knownEnemies, knownSet = {}, {}
+local function registerEnemy(enemy)
+    if enemy:IsA("Model") and not knownSet[enemy.Name] then
+        knownSet[enemy.Name] = true
+        table.insert(knownEnemies, enemy.Name)
+    end
+end
+if EnemiesFolder then
+    for _, e in ipairs(EnemiesFolder:GetChildren()) do registerEnemy(e) end
+    track(EnemiesFolder.ChildAdded:Connect(registerEnemy))
+end
+-- ไม่ทับค่าที่ผู้ใช้เซฟไว้ แม้มอนตัวนั้นยังไม่โหลด
+if Settings.SelectedMonster == "None" then
+    Settings.SelectedMonster = knownEnemies[1] or "None"
+end
+
+-- Anti-AFK: Roblox เตะคนที่ไม่มี input ครบ 20 นาที (การยิง remote ไม่นับเป็น input)
+track(player.Idled:Connect(function()
+    if not Settings.AntiAfk then return end
+    pcall(function()
+        local vu = game:GetService("VirtualUser")
+        vu:CaptureController()
+        vu:ClickButton2(Vector2.new())
+    end)
+end))
+
+-- [[ ระบบลูป: token ป้องกันลูปซ้อน + pcall ครอบทุกรอบ ]]
+local LoopTokens = {}
+
+local function startLoop(name, isEnabled, step)
+    local token = {}
+    LoopTokens[name] = token
+    local function isAlive()
+        return Runtime.alive and LoopTokens[name] == token and isEnabled()
+    end
+    task.spawn(function()
+        while isAlive() do
+            local ok, err = pcall(step, isAlive)
+            if not ok then
+                warn("[LuckyHub] " .. name .. ": " .. tostring(err))
+                task.wait(1)
+            end
+        end
+    end)
+end
+
+local function stopLoop(name)
+    LoopTokens[name] = nil
+end
+
+-- [[ ระบบต่อสู้ ]]
+local function matchesName(v, name)
+    return v:GetAttribute("DisplayNameOverride") == name or v.Name == name
+end
+
+local function matchesIsland(v, island)
+    local a = v:GetAttribute("WK_IslandName")
+    return a == nil or a == island
+end
+
+-- หา part สำหรับล็อกตำแหน่ง/เล็ง: HumanoidRootPart -> WK_HitPart (เช่น PumpkinKing) -> PrimaryPart -> part ใดก็ได้
+local function getEnemyRoot(enemy)
+    local part = enemy:FindFirstChild("HumanoidRootPart")
+    if not part then
+        local hitName = enemy:GetAttribute("WK_HitPart")
+        if type(hitName) == "string" then part = enemy:FindFirstChild(hitName, true) end
+    end
+    part = part or enemy.PrimaryPart or enemy:FindFirstChildWhichIsA("BasePart", true)
+    if part and part:IsA("BasePart") then return part end
+    return nil
+end
+
+-- มอนที่สู้ไม่จบ (เช่น ตีไม่เข้า) จะถูกข้ามชั่วคราว ไม่งั้น "ใกล้สุด" จะเลือกตัวเดิมซ้ำตลอด
+local Blacklist = setmetatable({}, { __mode = "k" })
+
+-- หามอนที่ตรงเงื่อนไขและ "ใกล้ที่สุดจากตัวเรา" (ไม่วิ่งข้ามแมพ)
+-- opts.allowImmune : รวมมอนที่อมตะ (WK_DamageImmune) ด้วย
+-- opts.center/radius : รับเฉพาะมอนที่อยู่ในรัศมีรอบจุด center (ใช้หามอนบริวารรอบบอส)
+local function getNearestEnemy(matchFn, opts)
+    opts = opts or {}
+    local myHRP = getMyHRP()
+    if not (EnemiesFolder and myHRP) then return nil end
+    local best, bestDist
+    for _, v in ipairs(EnemiesFolder:GetChildren()) do
+        local skipUntil = Blacklist[v]
+        if v:IsA("Model") and not (skipUntil and skipUntil > os.clock()) and matchFn(v)
+            and v:GetAttribute("WK_PooledInactive") ~= true -- ตัวที่อยู่ใน pool ยังไม่เกิดจริง
+            and (opts.allowImmune or v:GetAttribute("WK_DamageImmune") ~= true) then
+            local hrp = getEnemyRoot(v)
+            if hrp and getHealth(v) > 0 then
+                local inRange = true
+                if opts.radius and opts.center then
+                    inRange = (hrp.Position - opts.center).Magnitude <= opts.radius
+                end
+                if inRange then
+                    local d = (hrp.Position - myHRP.Position).Magnitude
+                    if not bestDist or d < bestDist then
+                        best, bestDist = v, d
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- เลือกเป้าหมายที่ควรตีตอนนี้ รองรับบอสที่อมตะจนกว่าจะเคลียร์มอนรอบตัว (เช่น RadesBoss)
+-- คืนค่า: enemy, ชนิด ("target" = ตีตามปกติ | "add" = มอนบริวารรอบบอสอมตะ | "immune" = บอสอมตะและไม่พบบริวาร | "none")
+local function pickTarget(matchFn)
+    local target = getNearestEnemy(matchFn)
+    if target then return target, "target" end
+
+    local boss = getNearestEnemy(matchFn, { allowImmune = true })
+    if not boss then return nil, "none" end -- ไม่มีเลย หรือมอนยังไม่โหลดเข้ามาใกล้ (streaming)
+
+    local bossRoot = getEnemyRoot(boss)
+    local add = bossRoot and getNearestEnemy(function(v) return v ~= boss end, {
+        center = bossRoot.Position,
+        radius = Settings.BossAddRadius,
+    })
+    if add then return add, "add" end
+    return nil, "immune"
+end
+
+-- [[ สกิล ]]
+-- รูปแบบ argument ยืนยันจากล็อก remote spy:
+--   สกิลเล็งเป้า : CastSkill(ชื่อ, CFrame, จุดเป้าหมาย)   เช่น DivineRain, LightPrison
+--   สกิลไม่เล็ง  : CastSkill(ชื่อ, CFrame)                เช่น LightSwords
+local UntargetedSkills = { LightSwords = true }
+local skillCache = { raw = nil, list = {} }
+local skillState = { index = 1, last = 0 }
+local comboState = { index = 1 } -- BasicAttack ตัวที่ 2 ที่เกมส่งจริงสลับ 1,2,1,2 (ยืนยันจากล็อก)
+
+local function getSkillList()
+    if skillCache.raw ~= Settings.SkillList then
+        skillCache.raw = Settings.SkillList
+        local list = {}
+        for piece in string.gmatch(Settings.SkillList, "[^,]+") do
+            local name = piece:match("^%s*(.-)%s*$")
+            if name ~= "" then table.insert(list, name) end
+        end
+        skillCache.list = list
+        skillState.index = 1
+    end
+    return skillCache.list
+end
+
+local function castNextSkill(aimCFrame, targetPos)
+    if not CastSkillRemote then return end
+    local list = getSkillList()
+    if #list == 0 then return end
+    if skillState.index > #list then skillState.index = 1 end
+    local name = list[skillState.index]
+    skillState.index = skillState.index + 1
+    if UntargetedSkills[name] then
+        fire(CastSkillRemote, name, aimCFrame)
+    else
+        fire(CastSkillRemote, name, aimCFrame, targetPos)
+    end
+end
+
+-- [[ เช็กเลือดตัวเอง ]]
+local function getMyHpPercent()
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum and hum.MaxHealth > 0 then
+        return hum.Health / hum.MaxHealth * 100
+    end
+    return 100
+end
+
+-- เลือดต่ำกว่าที่ตั้งไว้ -> ลอยขึ้นสูงหนีมอน รอฟื้น (สูงสุด 60 วินาทีแล้วกลับไปสู้ต่อ)
+local function retreatUntilHealed(isAlive)
+    local myHRP = getMyHRP()
+    if myHRP then myHRP.CFrame = myHRP.CFrame + Vector3.new(0, 80, 0) end
+    Status.state = "HP ต่ำ - พักฟื้น"
+    local resumeAt = math.min(Settings.MinHpPercent + 25, 95)
+    local t0 = os.clock()
+    while isAlive() and getMyHpPercent() < resumeAt and os.clock() - t0 < 60 do
+        task.wait(0.5)
+    end
+end
+
+-- ฟังก์ชันโจมตีตัวเดียว ใช้ร่วมกันทั้งสองโหมดฟาร์ม
+local function fightEnemy(enemy, isAlive)
+    local hrp = getEnemyRoot(enemy)
+    if not hrp then return end
+    local startTime = os.clock()
+    while isAlive() and enemy.Parent and hrp.Parent and getHealth(enemy) > 0 do
+        -- เป้าหมายกลายเป็นอมตะระหว่างสู้ (เปลี่ยนเฟส) -> หยุดตี ให้ลูปหลักเลือกเป้าใหม่
+        if enemy:GetAttribute("WK_DamageImmune") == true then break end
+        local myHRP = getMyHRP()
+        if not myHRP then break end -- ตายอยู่ ออกไปให้ลูปหลักตรวจใหม่
+
+        if Settings.MinHpPercent > 0 and getMyHpPercent() < Settings.MinHpPercent then
+            retreatUntilHealed(isAlive)
+            startTime = os.clock() -- ไม่นับเวลาพักเป็นเวลาต่อสู้
+        else
+            local myPos, targetPos = getFarmPosition(hrp)
+            local aimCFrame = CFrame.lookAt(myPos, targetPos)
+            myHRP.CFrame = aimCFrame
+            if BasicAttackEvent then
+                if player:GetAttribute("WK_ActiveCombatStyle") == "Fists" then
+                    -- สไตล์หมัด: เกมส่งแค่ CFrame ตัวเดียว (ยืนยันจากล็อก)
+                    BasicAttackEvent:FireServer(aimCFrame)
+                else
+                    -- สไตล์ Magic: (CFrame, คอมโบ 1/2 สลับกัน, จุดเป้าหมาย, 0) (ยืนยันจากล็อก)
+                    comboState.index = (comboState.index == 1) and 2 or 1
+                    BasicAttackEvent:FireServer(aimCFrame, comboState.index, targetPos, 0)
+                end
+            end
+            if Settings.AutoSkill and os.clock() - skillState.last >= Settings.SkillInterval then
+                skillState.last = os.clock()
+                castNextSkill(aimCFrame, targetPos)
+            end
+            task.wait(0.1)
+        end
+
+        if os.clock() - startTime > 15 then
+            Blacklist[enemy] = os.clock() + 10
+            break
+        end
+    end
+    if not enemy.Parent or getHealth(enemy) <= 0 then
+        Status.kills = Status.kills + 1
+    end
+end
+
+-- ไปยืนข้าง NPC ให้เควสต์ (ใช้เมื่อรับเควสต์จากระยะไกลไม่ติด)
+-- ชื่อ NPC อ้างอิงจากโครงสร้างเกม: แต่ละเกาะมี MobNPC (เควสต์ Kill) และ BossNPC (เควสต์ Boss)
+local function goToQuestNpc(q)
+    local island = workspace:FindFirstChild(q.island)
+    local npcName = string.find(q.quest, "_Boss$") and "BossNPC" or "MobNPC"
+    local npc = island and island:FindFirstChild(npcName)
+    local myHRP = getMyHRP()
+    if not (npc and myHRP) then return false end
+    local ok, pivot = pcall(function() return npc:GetPivot() end)
+    if not ok then return false end
+    myHRP.CFrame = pivot * CFrame.new(0, 2, 5)
+    task.wait(0.6)
+    return true
+end
+
+-- [[ เก็บดรอปอัตโนมัติ ]]
+-- ดรอปของเกมอยู่ใน Workspace.WK_MaterialDrops / WK_GrimoireDrops / WK_ItemDrops
+-- แต่ละชิ้นมี ProximityPrompt (MaterialNode มี attribute WK_MatId บอกชนิดวัตถุดิบ)
+local DropFolderNames = { "WK_MaterialDrops", "WK_GrimoireDrops", "WK_ItemDrops" }
+local collectTried = setmetatable({}, { __mode = "k" }) -- prompt -> เวลาที่ลองเก็บล่าสุด
+
+local function promptPosition(prompt)
+    local p = prompt.Parent
+    if not p then return nil end
+    if p:IsA("BasePart") then return p.Position end
+    if p:IsA("Attachment") then return p.WorldPosition end
+    if p:IsA("Model") then return p:GetPivot().Position end
+    return nil
+end
+
+local function getNearestDropPrompt(range)
+    local myHRP = getMyHRP()
+    if not myHRP then return nil end
+    local best, bestDist = nil, range
+    for _, name in ipairs(DropFolderNames) do
+        local folder = workspace:FindFirstChild(name)
+        if folder then
+            for _, d in ipairs(folder:GetDescendants()) do
+                if d:IsA("ProximityPrompt") and d.Enabled then
+                    local tried = collectTried[d]
+                    if not (tried and os.clock() - tried < 5) then
+                        local pos = promptPosition(d)
+                        if pos then
+                            local dist = (pos - myHRP.Position).Magnitude
+                            if dist <= bestDist then best, bestDist = d, dist end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function triggerPrompt(prompt)
+    if fireproximityprompt then
+        fireproximityprompt(prompt)
+    else
+        prompt:InputHoldBegin()
+        task.wait((prompt.HoldDuration or 0) + 0.1)
+        prompt:InputHoldEnd()
+    end
+end
+
+-- เก็บดรอปในระยะ CollectRange (สูงสุด 8 ชิ้นต่อครั้ง เพื่อไม่ให้ค้างอยู่กับการเก็บนานเกิน)
+local function collectNearbyDrops(isAlive)
+    local count = 0
+    while count < 8 and isAlive() do
+        local prompt = getNearestDropPrompt(Settings.CollectRange)
+        if not prompt then break end
+        local pos = promptPosition(prompt)
+        local myHRP = getMyHRP()
+        if not (pos and myHRP) then break end
+        collectTried[prompt] = os.clock() -- ชิ้นที่เก็บไม่หาย จะไม่ถูกลองซ้ำภายใน 5 วินาที
+        myHRP.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+        task.wait(0.15)
+        pcall(triggerPrompt, prompt)
+        task.wait(0.25)
+        count = count + 1
+    end
+end
+
+-- ==============================================================================
+-- PART 3: UI Framework
+-- ==============================================================================
+
+local oldGui = playerGui:FindFirstChild("LuckyHub_UI")
+if oldGui then oldGui:Destroy() end
+
+-- ตั้ง property ให้ครบก่อนค่อยกำหนด Parent (แนวทางที่ Roblox แนะนำ)
+local function New(class, props, parent)
+    local inst = Instance.new(class)
+    for k, v in pairs(props or {}) do inst[k] = v end
+    inst.Parent = parent
+    return inst
+end
+
+local function corner(inst, r)
+    return New("UICorner", { CornerRadius = (typeof(r) == "UDim") and r or UDim.new(0, r) }, inst)
+end
+
+local function stroke(inst, color, thickness)
+    return New("UIStroke", {
+        Color = color,
+        Thickness = thickness,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, inst)
+end
+
+local function isPointer(input)
+    return input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local function isPointerMove(input)
+    return input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
+ScreenGui = New("ScreenGui", { Name = "LuckyHub_UI", ResetOnSpawn = false }, playerGui)
+
+-- ปุ่มลอย (ลากได้ / แตะเพื่อเปิด-ปิด)
+local FloatingToggle = New("TextButton", {
+    Size = UDim2.fromOffset(48, 48),
+    Position = UDim2.new(0.02, 0, 0.2, 0),
+    BackgroundColor3 = UITheme.MainBg,
+    Text = "☘️",
+    TextSize = 20,
+}, ScreenGui)
+corner(FloatingToggle, 14)
+stroke(FloatingToggle, UITheme.Accent, 1.4)
+
+local draggingFloat, dragMoved = false, false
+local dragStart, startPos
+FloatingToggle.InputBegan:Connect(function(input)
+    if isPointer(input) then
+        draggingFloat = true
+        dragMoved = false
+        dragStart = input.Position
+        startPos = FloatingToggle.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then draggingFloat = false end
+        end)
+    end
+end)
+track(UserInputService.InputChanged:Connect(function(input)
+    if draggingFloat and isPointerMove(input) then
+        local delta = input.Position - dragStart
+        if delta.Magnitude > 6 then dragMoved = true end -- ต้องลากเกิน 6px ถึงนับว่าเป็นการลาก
+        if dragMoved then
+            FloatingToggle.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end
+end))
+
+-- กรอบหน้าต่างหลัก
+local MainFrame = New("Frame", {
+    Size = UDim2.fromOffset(520, 340),
+    Position = UDim2.new(0.5, -260, 0.5, -170),
+    BackgroundColor3 = UITheme.MainBg,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+}, ScreenGui)
+corner(MainFrame, 16)
+stroke(MainFrame, UITheme.Stroke, 1.2)
+
+local Header = New("Frame", { Size = UDim2.new(1, 0, 0, 42), BackgroundTransparency = 1 }, MainFrame)
+
+New("TextLabel", {
+    Text = "🍀 Lucky<font color='#387ef5'>Hub</font> <font color='#8290a8'>• Ultimate</font>",
+    RichText = true,
+    Size = UDim2.new(0.7, 0, 1, 0),
+    Position = UDim2.new(0, 16, 0, 0),
+    TextColor3 = UITheme.Text,
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    BackgroundTransparency = 1,
+}, Header)
+
+local CloseBtn = New("TextButton", {
+    Text = "✕",
+    Size = UDim2.fromOffset(26, 26),
+    Position = UDim2.new(1, -38, 0.5, -13),
+    BackgroundColor3 = UITheme.Card,
+    TextColor3 = UITheme.SubText,
+    Font = Enum.Font.GothamBold,
+    TextSize = 11,
+}, Header)
+corner(CloseBtn, 6)
+
+local isGuiOpen = true
+local function toggleUI()
+    isGuiOpen = not isGuiOpen
+    MainFrame.Visible = isGuiOpen
+end
+FloatingToggle.MouseButton1Click:Connect(function()
+    if dragMoved then dragMoved = false return end -- เพิ่งลากมา ไม่ใช่การกด
+    toggleUI()
+end)
+CloseBtn.MouseButton1Click:Connect(toggleUI)
+
+local Sidebar = New("Frame", {
+    Size = UDim2.new(0, 120, 1, -50),
+    Position = UDim2.new(0, 10, 0, 44),
+    BackgroundColor3 = UITheme.Sidebar,
+}, MainFrame)
+corner(Sidebar, 12)
+New("UIListLayout", {
+    Padding = UDim.new(0, 4),
+    HorizontalAlignment = Enum.HorizontalAlignment.Center,
+}, Sidebar)
+
+local ContentArea = New("Frame", {
+    Size = UDim2.new(1, -148, 1, -50),
+    Position = UDim2.new(0, 138, 0, 44),
+    BackgroundTransparency = 1,
+}, MainFrame)
+
+local Tabs = {}
+local function selectTab(name)
+    for n, t in pairs(Tabs) do
+        local active = (n == name)
+        t.Scroll.Visible = active
+        t.Button.TextColor3 = active and UITheme.Accent or UITheme.SubText
+        t.Button.BackgroundColor3 = active and UITheme.CardActive or UITheme.Sidebar
+    end
+end
+
+local function addTab(tabName, iconText)
+    local TabBtn = New("TextButton", {
+        Size = UDim2.new(1, -10, 0, 32),
+        BackgroundColor3 = UITheme.Sidebar,
+        Text = "  " .. iconText .. " " .. tabName,
+        TextColor3 = UITheme.SubText,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, Sidebar)
+    corner(TabBtn, 8)
+
+    local TabScroll = New("ScrollingFrame", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        ScrollBarThickness = 2,
+        ScrollBarImageColor3 = UITheme.Accent,
+        Visible = false,
+    }, ContentArea)
+
+    local Layout = New("UIListLayout", { Padding = UDim.new(0, 6) }, TabScroll)
+    Layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        TabScroll.CanvasSize = UDim2.new(0, 0, 0, Layout.AbsoluteContentSize.Y + 12)
+    end)
+
+    TabBtn.MouseButton1Click:Connect(function() selectTab(tabName) end)
+    Tabs[tabName] = { Button = TabBtn, Scroll = TabScroll }
+    return TabScroll
+end
+
+-- Modal เลือกรายการ
+local ModalFrame = New("Frame", {
+    Size = UDim2.new(1, -20, 1, -20),
+    Position = UDim2.new(0, 10, 0, 10),
+    BackgroundColor3 = UITheme.MainBg,
+    Visible = false,
+    ZIndex = 30,
+}, MainFrame)
+corner(ModalFrame, 12)
+stroke(ModalFrame, UITheme.Accent, 1.2)
+
+local ModalHeader = New("Frame", {
+    Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1, ZIndex = 31,
+}, ModalFrame)
+
+local ModalTitle = New("TextLabel", {
+    Text = "Select",
+    Size = UDim2.new(0.6, 0, 1, 0),
+    Position = UDim2.new(0, 12, 0, 0),
+    TextColor3 = UITheme.Text,
+    Font = Enum.Font.GothamBold,
+    TextSize = 13,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    BackgroundTransparency = 1,
+    ZIndex = 31,
+}, ModalHeader)
+
+local ModalClose = New("TextButton", {
+    Text = "✕",
+    Size = UDim2.fromOffset(24, 24),
+    Position = UDim2.new(1, -34, 0.5, -12),
+    BackgroundColor3 = UITheme.Card,
+    TextColor3 = UITheme.Red,
+    Font = Enum.Font.GothamBold,
+    TextSize = 11,
+    ZIndex = 31,
+}, ModalHeader)
+corner(ModalClose, 6)
+ModalClose.MouseButton1Click:Connect(function() ModalFrame.Visible = false end)
+
+local SearchBox = New("TextBox", {
+    Size = UDim2.new(1, -24, 0, 30),
+    Position = UDim2.new(0, 12, 0, 42),
+    BackgroundColor3 = UITheme.Card,
+    TextColor3 = UITheme.Text,
+    PlaceholderColor3 = UITheme.SubText,
+    PlaceholderText = "Type to search...",
+    Text = "",
+    Font = Enum.Font.Gotham,
+    TextSize = 12,
+    ClearTextOnFocus = false,
+    ZIndex = 31,
+}, ModalFrame)
+corner(SearchBox, 6)
+
+local ModalScroll = New("ScrollingFrame", {
+    Size = UDim2.new(1, -24, 1, -85),
+    Position = UDim2.new(0, 12, 0, 78),
+    BackgroundTransparency = 1,
+    ScrollBarThickness = 2,
+    ScrollBarImageColor3 = UITheme.Accent,
+    ZIndex = 31,
+}, ModalFrame)
+
+local ModalListLayout = New("UIListLayout", { Padding = UDim.new(0, 4) }, ModalScroll)
+ModalListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    ModalScroll.CanvasSize = UDim2.new(0, 0, 0, ModalListLayout.AbsoluteContentSize.Y + 8)
+end)
+
+local searchConn -- เก็บไว้เพื่อตัดของเก่าทุกครั้งที่เปิด modal ใหม่
+local function openSelectionModal(title, items, current, onSelect)
+    ModalTitle.Text = title
+    if searchConn then searchConn:Disconnect() searchConn = nil end
+    SearchBox.Text = ""
+
+    local function renderList(filter)
+        for _, c in ipairs(ModalScroll:GetChildren()) do
+            if c:IsA("TextButton") then c:Destroy() end
+        end
+        local f = string.lower(filter or "")
+        for _, item in ipairs(items) do
+            -- plain find: พิมพ์ ( [ % ในช่องค้นหาแล้วไม่ error
+            if f == "" or string.find(string.lower(item), f, 1, true) then
+                local isCurrent = (item == current)
+                local ItemBtn = New("TextButton", {
+                    Size = UDim2.new(1, 0, 0, 30),
+                    BackgroundColor3 = isCurrent and UITheme.CardActive or UITheme.Card,
+                    Text = "  " .. item,
+                    TextColor3 = isCurrent and UITheme.Accent or UITheme.Text,
+                    Font = Enum.Font.GothamMedium,
+                    TextSize = 11,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ZIndex = 32,
+                }, ModalScroll)
+                corner(ItemBtn, 6)
+                ItemBtn.MouseButton1Click:Connect(function()
+                    onSelect(item)
+                    ModalFrame.Visible = false
+                end)
+            end
+        end
+    end
+
+    renderList("")
+    searchConn = SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+        renderList(SearchBox.Text)
+    end)
+    ModalFrame.Visible = true
+end
+
+-- ---------- Component Generators ----------
+local function createCard(parent, height)
+    local Card = New("Frame", {
+        Size = UDim2.new(1, -4, 0, height),
+        BackgroundColor3 = UITheme.Card,
+    }, parent)
+    corner(Card, 10)
+    stroke(Card, UITheme.Stroke, 1)
+    return Card
+end
+
+-- คืน object ที่มี :Set(state) สำหรับเปลี่ยนสวิตช์จากโค้ด (ไม่เรียก callback)
+-- ถ้า default = true จะเรียก callback(true) ให้อัตโนมัติ เพื่อ resume ค่าที่เซฟไว้
+local function createCardToggle(parent, titleText, descText, default, callback)
+    local Card = createCard(parent, 48)
+
+    New("TextLabel", {
+        Text = titleText,
+        Size = UDim2.new(0.65, 0, 0, 18),
+        Position = UDim2.new(0, 12, 0, 6),
+        TextColor3 = UITheme.Text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+    }, Card)
+
+    New("TextLabel", {
+        Text = descText or "",
+        Size = UDim2.new(0.65, 0, 0, 14),
+        Position = UDim2.new(0, 12, 0, 24),
+        TextColor3 = UITheme.SubText,
+        Font = Enum.Font.Gotham,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+    }, Card)
+
+    local state = default and true or false
+
+    local Switch = New("TextButton", {
+        Text = "",
+        Size = UDim2.fromOffset(38, 20),
+        Position = UDim2.new(1, -48, 0.5, -10),
+        BackgroundColor3 = state and UITheme.Accent or UITheme.ToggleOff,
+    }, Card)
+    corner(Switch, UDim.new(1, 0))
+
+    local Knob = New("Frame", {
+        Size = UDim2.fromOffset(14, 14),
+        Position = state and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7),
+        BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+    }, Switch)
+    corner(Knob, UDim.new(1, 0))
+
+    local function applyVisual()
+        TweenService:Create(Switch, TweenInfo.new(0.2), {
+            BackgroundColor3 = state and UITheme.Accent or UITheme.ToggleOff,
+        }):Play()
+        TweenService:Create(Knob, TweenInfo.new(0.2), {
+            Position = state and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7),
+        }):Play()
+    end
+
+    Switch.MouseButton1Click:Connect(function()
+        state = not state
+        applyVisual()
+        callback(state)
+        saveConfig()
+    end)
+
+    local api = {}
+    function api.Set(v)
+        state = v and true or false
+        applyVisual()
+    end
+
+    if state then task.defer(callback, true) end
+    return api
+end
+
+local function createSelectorCard(parent, titleText, currentText, onTrigger)
+    local Card = createCard(parent, 42)
+
+    New("TextLabel", {
+        Text = titleText,
+        Size = UDim2.new(0.45, 0, 1, 0),
+        Position = UDim2.new(0, 12, 0, 0),
+        TextColor3 = UITheme.Text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+    }, Card)
+
+    local SelectBtn = New("TextButton", {
+        Text = tostring(currentText) .. " ▾",
+        Size = UDim2.new(0.48, 0, 0, 26),
+        Position = UDim2.new(0.5, 0, 0.5, -13),
+        BackgroundColor3 = UITheme.Sidebar,
+        TextColor3 = UITheme.Accent,
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+    }, Card)
+    corner(SelectBtn, 6)
+
+    SelectBtn.MouseButton1Click:Connect(function()
+        onTrigger(function(newVal)
+            SelectBtn.Text = tostring(newVal) .. " ▾"
+        end)
+    end)
+end
+
+local function createSliderCard(parent, titleText, min, max, default, callback)
+    local Card = createCard(parent, 46)
+    default = math.clamp(default, min, max)
+
+    New("TextLabel", {
+        Text = titleText,
+        Size = UDim2.new(0.6, 0, 0, 16),
+        Position = UDim2.new(0, 12, 0, 5),
+        TextColor3 = UITheme.Text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+    }, Card)
+
+    local ValLabel = New("TextLabel", {
+        Text = tostring(default),
+        Size = UDim2.new(0.4, -12, 0, 16),
+        Position = UDim2.new(0.6, 0, 0, 5),
+        TextColor3 = UITheme.Accent,
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        BackgroundTransparency = 1,
+    }, Card)
+
+    local SliderBar = New("Frame", {
+        Size = UDim2.new(1, -24, 0, 4),
+        Position = UDim2.new(0, 12, 0, 30),
+        BackgroundColor3 = UITheme.Sidebar,
+    }, Card)
+    corner(SliderBar, UDim.new(1, 0))
+
+    local Fill = New("Frame", {
+        Size = UDim2.new(math.clamp((default - min) / (max - min), 0, 1), 0, 1, 0),
+        BackgroundColor3 = UITheme.Accent,
+    }, SliderBar)
+    corner(Fill, UDim.new(1, 0))
+
+    local dragging = false
+    local function update(input)
+        local width = math.max(SliderBar.AbsoluteSize.X, 1)
+        local pos = math.clamp((input.Position.X - SliderBar.AbsolutePosition.X) / width, 0, 1)
+        Fill.Size = UDim2.new(pos, 0, 1, 0)
+        local val = math.floor(min + ((max - min) * pos) + 0.5) -- ปัดเศษ เพื่อให้ถึงค่า max ได้
+        ValLabel.Text = tostring(val)
+        callback(val)
+        saveConfig() -- debounce อยู่ใน saveConfig แล้ว
+    end
+
+    SliderBar.InputBegan:Connect(function(input)
+        if isPointer(input) then
+            dragging = true
+            update(input)
+        end
+    end)
+    track(UserInputService.InputEnded:Connect(function(input)
+        if isPointer(input) then dragging = false end
+    end))
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and isPointerMove(input) then update(input) end
+    end))
+end
+
+-- กล่องพิมพ์ข้อความ (บันทึกเมื่อกด Enter หรือคลิกออกนอกกล่อง)
+local function createTextBoxCard(parent, titleText, default, callback)
+    local Card = createCard(parent, 56)
+    New("TextLabel", {
+        Text = titleText,
+        Size = UDim2.new(1, -24, 0, 16),
+        Position = UDim2.new(0, 12, 0, 5),
+        TextColor3 = UITheme.Text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+    }, Card)
+    local Box = New("TextBox", {
+        Size = UDim2.new(1, -24, 0, 26),
+        Position = UDim2.new(0, 12, 0, 25),
+        BackgroundColor3 = UITheme.Sidebar,
+        TextColor3 = UITheme.Accent,
+        Text = tostring(default),
+        ClearTextOnFocus = false,
+        Font = Enum.Font.Gotham,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, Card)
+    corner(Box, 6)
+    Box.FocusLost:Connect(function()
+        callback(Box.Text)
+        saveConfig()
+    end)
+    return Box
+end
+
+local function createButtonCard(parent, text, color, callback)
+    local Card = createCard(parent, 40)
+    local Btn = New("TextButton", {
+        Text = text,
+        Size = UDim2.new(1, -24, 0, 26),
+        Position = UDim2.new(0, 12, 0.5, -13),
+        BackgroundColor3 = UITheme.Sidebar,
+        TextColor3 = color,
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+    }, Card)
+    corner(Btn, 6)
+    Btn.MouseButton1Click:Connect(callback)
+    return Btn
+end
+
+-- การ์ดแสดงข้อความหลายบรรทัด (คืน TextLabel ให้อัปเดตข้อความเอง)
+local function createInfoCard(parent, height)
+    local Card = createCard(parent, height)
+    return New("TextLabel", {
+        Size = UDim2.new(1, -24, 1, -12),
+        Position = UDim2.new(0, 12, 0, 6),
+        BackgroundTransparency = 1,
+        TextColor3 = UITheme.SubText,
+        Font = Enum.Font.Gotham,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextWrapped = true,
+        Text = "",
+    }, Card)
+end
+
+-- การ์ดเลือกเผ่า: ปุ่ม [ไม่เลือก] [★1] [★2] [★3] เลือกระดับขั้นต่ำที่ต้องการของเผ่านั้น
+local function createRaceCard(parent, race)
+    local data = RaceData[race]
+    local Card = createCard(parent, 96)
+    New("TextLabel", {
+        Text = string.format("%s   %d%%   %s", race, data.odds, data.theme),
+        Size = UDim2.new(1, -24, 0, 16),
+        Position = UDim2.new(0, 12, 0, 6),
+        TextColor3 = UITheme.Text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+    }, Card)
+    local Goal = New("TextLabel", {
+        Size = UDim2.new(1, -24, 0, 14),
+        Position = UDim2.new(0, 12, 0, 23),
+        TextColor3 = UITheme.SubText,
+        Font = Enum.Font.Gotham,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+        Text = "",
+    }, Card)
+    local Holder = New("Frame", {
+        Size = UDim2.new(1, -24, 0, 26),
+        Position = UDim2.new(0, 12, 0, 41),
+        BackgroundTransparency = 1,
+    }, Card)
+    New("TextLabel", {
+        Text = "★1 " .. data.tiers[1] .. " · ★2 " .. data.tiers[2] .. " · ★3 " .. data.tiers[3],
+        Size = UDim2.new(1, -24, 0, 14),
+        Position = UDim2.new(0, 12, 0, 74),
+        TextColor3 = UITheme.SubText,
+        Font = Enum.Font.Gotham,
+        TextSize = 9,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        BackgroundTransparency = 1,
+    }, Card)
+
+    local labels = { "ไม่เลือก", "★1", "★2", "★3" }
+    local buttons = {}
+    local function refresh()
+        local level = Settings.RaceTargets[race] or 0
+        for i, b in ipairs(buttons) do
+            local on = (i - 1) == level
+            b.BackgroundColor3 = on and (i == 1 and UITheme.ToggleOff or UITheme.Accent) or UITheme.Sidebar
+            b.TextColor3 = on and UITheme.Text or UITheme.SubText
+        end
+        if level == 0 then
+            Goal.Text = "ไม่เลือก"
+        else
+            Goal.Text = "ต้องการ: ★" .. level .. " " .. data.tiers[level] .. (level < 3 and " ขึ้นไป" or "")
+        end
+    end
+    for i, label in ipairs(labels) do
+        local b = New("TextButton", {
+            Text = label,
+            Size = UDim2.new(0.25, -4, 1, 0),
+            Position = UDim2.new((i - 1) * 0.25, 2, 0, 0),
+            Font = Enum.Font.GothamBold,
+            TextSize = 11,
+            AutoButtonColor = false,
+        }, Holder)
+        corner(b, 6)
+        b.MouseButton1Click:Connect(function()
+            Settings.RaceTargets[race] = i - 1
+            refresh()
+            saveConfig()
+        end)
+        buttons[i] = b
+    end
+    refresh()
+    return Card
+end
+
+-- ==============================================================================
+-- PART 4: Tabs & Features
+-- ==============================================================================
+
+local FarmTab = addTab("Farming", "⚔️")
+local GrimoireTab = addTab("Grimoire", "📖")
+local ShopTab = addTab("Shop/World", "🛒")
+local BossTab = addTab("Boss", "👹")
+local RaceTab = addTab("Race", "🧬")
+local MiscTab = addTab("Misc", "🧰")
+selectTab("Farming")
+
+-- --- แผงสถานะ (แสดงเลเวลที่อ่านได้ เป้าหมาย และสถานะปัจจุบัน) ---
+local StatusLabel = createInfoCard(FarmTab, 74)
+do
+    local warnedNoLabel = false
+    task.spawn(function()
+        while Runtime.alive do
+            local labelOk = levelLabel and levelLabel.Parent
+            local lv = labelOk and tostring(cachedLevel) or (tostring(cachedLevel) .. " (ไม่พบ label เลเวล)")
+            local t = farmState.target
+            local up = math.floor(os.clock() - Status.startTime)
+            StatusLabel.Text = string.format(
+                "Lv: %s   Kills: %d   Uptime: %02d:%02d:%02d\nQuest: %s (%s)\nเป้าหมาย: %s\nสถานะ: %s",
+                lv, Status.kills, math.floor(up / 3600), math.floor(up % 3600 / 60), up % 60,
+                t and t.quest or "-", checkQuestActive() and "มีเควสต์ค้าง" or "ไม่มีเควสต์",
+                t and (t.mob .. " @ " .. t.island) or "-",
+                Status.state
+            )
+            -- เตือนครั้งเดียว ถ้าเปิดฟาร์มแล้วหา label เลเวลไม่เจอ (จะฟาร์มเควสต์เลเวล 1 ตลอด)
+            if Settings.AutoFarmLevel and not labelOk and not warnedNoLabel then
+                warnedNoLabel = true
+                notify("Lucky Hub", "ไม่พบ label เลเวลบน HUD ระบบจะเลือกเควสต์ผิด", 6)
+            end
+            task.wait(1)
+        end
+    end)
+end
+
+-- ปุ่มลัด RightShift เปิด/ปิด UI (บน PC)
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if not processed and input.KeyCode == Enum.KeyCode.RightShift then toggleUI() end
+end))
+
+-- --- TAB 1: FARMING ---
+local farmToggle, selectedToggle, bossToggle
+
+local function autoFarmStep(isAlive)
+    updateLevel()
+
+    -- ล็อกเป้าหมายไว้ตราบที่เควสต์ยังค้าง (กันเลเวลข้ามช่วงกลางเควสต์แล้วไปฟาร์มมอนผิดตัว)
+    -- คำนวณใหม่จากเลเวลเฉพาะตอนไม่มีเควสต์ หรือยังไม่เคยล็อก (เช่น เปิดฟาร์มตอนเควสต์ค้างอยู่)
+    if not farmState.target or not checkQuestActive() then
+        farmState.target = getQuestForLevel(cachedLevel)
+    end
+    local q = farmState.target
+    if not q then task.wait(1) return end
+
+    -- ไปเกาะที่ตรงกับเลเวล (ครั้งเดียวต่อเกาะ)
+    if TeleportRemote and q.island ~= farmState.lastIsland then
+        Status.state = "วาร์ปไป " .. q.island
+        fire(TeleportRemote, q.island)
+        farmState.lastIsland = q.island
+        task.wait(3.5)
+        if not isAlive() then return end
+    end
+
+    -- รับเควสต์เฉพาะเมื่อไม่มีเควสต์ค้าง (และไม่ยิงถี่กว่า 3 วินาที)
+    -- ยืนยันจากล็อก: AcceptQuest("STARTER_Ch1_Kill") ยิงตรงๆ โดยไม่มี InteractNpc นำหน้า
+    if AcceptQuest and not checkQuestActive() and os.clock() - farmState.lastAccept > 3 then
+        farmState.lastAccept = os.clock()
+        Status.state = "รับเควสต์ " .. q.quest
+        -- รับไม่ติดติดกันหลายครั้ง (เช่น เซิร์ฟเวอร์เช็กระยะห่างจาก NPC) -> ไปยืนข้าง NPC แล้วรับใหม่
+        -- ทำครั้งเดียวต่อเควสต์ กันวาร์ปไปมาถ้าตรวจสถานะเควสต์ผิดพลาด
+        if farmState.acceptFails >= 2 and farmState.npcVisited ~= q.quest then
+            farmState.npcVisited = q.quest
+            goToQuestNpc(q)
+        end
+        fire(AcceptQuest, q.quest)
+        task.wait(1)
+        if checkQuestActive() then
+            farmState.acceptFails = 0
+        else
+            farmState.acceptFails = farmState.acceptFails + 1
+        end
+        if not isAlive() then return end
+    end
+
+    -- เก็บดรอปที่เพิ่งตกระหว่างรอบต่อสู้ (ทำระหว่างรอบเท่านั้น ไม่แย่ง CFrame กับตอนสู้)
+    if Settings.AutoCollect then
+        Status.state = "เก็บดรอป"
+        collectNearbyDrops(isAlive)
+        if not isAlive() then return end
+    end
+
+    local enemy, kind = pickTarget(function(v)
+        return matchesName(v, q.mob) and matchesIsland(v, q.island)
+    end)
+    if enemy then
+        Status.state = (kind == "add" and "เคลียร์มอนบริวารรอบ " or "ต่อสู้: ") .. q.mob
+        fightEnemy(enemy, isAlive)
+    else
+        Status.state = (kind == "immune" and "บอสอมตะ รอมอนบริวาร/เปลี่ยนเฟส: " or "รอมอนเกิด: ") .. q.mob
+        task.wait(0.5)
+    end
+    task.wait(0.2)
+end
+
+local function farmSelectedStep(isAlive)
+    local target = Settings.SelectedMonster
+    if Settings.AutoCollect then
+        Status.state = "เก็บดรอป"
+        collectNearbyDrops(isAlive)
+        if not isAlive() then return end
+    end
+    local enemy, kind = pickTarget(function(v) return matchesName(v, target) end)
+    if enemy then
+        Status.state = (kind == "add" and "เคลียร์มอนบริวารรอบ " or "ต่อสู้: ") .. target
+        fightEnemy(enemy, isAlive)
+    else
+        Status.state = (kind == "immune" and "บอสอมตะ รอมอนบริวาร/เปลี่ยนเฟส: " or "รอมอนเกิด: ") .. target
+        task.wait(0.5)
+    end
+    task.wait(0.2)
+end
+
+farmToggle = createCardToggle(FarmTab, "Auto Farm (Dynamic Quest)", "ล็อกเกาะและเควสต์จนกว่าจะเสร็จ 100%",
+    Settings.AutoFarmLevel, function(state)
+        Settings.AutoFarmLevel = state
+        if state then
+            -- ปิดอีกโหมดก่อน กันสองลูปแย่งกันตั้งตำแหน่ง
+            if Settings.AutoBoss then
+                Settings.AutoBoss = false
+                stopLoop("AutoBoss")
+                if bossToggle then bossToggle.Set(false) end
+            end
+            if Settings.FarmSelected then
+                Settings.FarmSelected = false
+                stopLoop("FarmSelected")
+                if selectedToggle then selectedToggle.Set(false) end
+            end
+            farmState.target = nil
+            farmState.acceptFails = 0
+            farmState.npcVisited = nil
+            startLoop("AutoFarm", function() return Settings.AutoFarmLevel end, autoFarmStep)
+        else
+            stopLoop("AutoFarm")
+        end
+    end)
+
+createSelectorCard(FarmTab, "Target Specific Monster", Settings.SelectedMonster, function(updateBtn)
+    openSelectionModal("Select Monster", knownEnemies, Settings.SelectedMonster, function(chosen)
+        Settings.SelectedMonster = chosen
+        updateBtn(chosen)
+        saveConfig()
+    end)
+end)
+
+selectedToggle = createCardToggle(FarmTab, "Farm Selected Monster", "ฟาร์มเฉพาะมอนสเตอร์ที่เลือกจากรายการ",
+    Settings.FarmSelected, function(state)
+        Settings.FarmSelected = state
+        if state then
+            if Settings.AutoBoss then
+                Settings.AutoBoss = false
+                stopLoop("AutoBoss")
+                if bossToggle then bossToggle.Set(false) end
+            end
+            if Settings.AutoFarmLevel then
+                Settings.AutoFarmLevel = false
+                stopLoop("AutoFarm")
+                if farmToggle then farmToggle.Set(false) end
+            end
+            startLoop("FarmSelected", function() return Settings.FarmSelected end, farmSelectedStep)
+        else
+            stopLoop("FarmSelected")
+        end
+    end)
+
+createSelectorCard(FarmTab, "Height Mode", Settings.HeightMode, function(updateBtn)
+    openSelectionModal("Height Mode", { "Above", "Below" }, Settings.HeightMode, function(chosen)
+        Settings.HeightMode = chosen
+        updateBtn(chosen)
+        saveConfig()
+    end)
+end)
+
+createSliderCard(FarmTab, "Attack Distance", 0, 15, Settings.AttackDistance, function(val) Settings.AttackDistance = val end)
+createSliderCard(FarmTab, "Height Offset (Y)", 1, 25, Settings.HeightOffset, function(val) Settings.HeightOffset = val end)
+
+-- เก็บดรอป: ตอนฟาร์มอยู่จะเก็บระหว่างรอบต่อสู้ ตอนไม่ได้ฟาร์มจะทำงานเป็นลูปเดี่ยว
+createCardToggle(FarmTab, "Auto Collect Drops", "เก็บวัตถุดิบ/ดรอปในระยะที่กำหนด",
+    Settings.AutoCollect, function(state)
+        Settings.AutoCollect = state
+        if state then
+            startLoop("AutoCollect", function() return Settings.AutoCollect end, function(isAlive)
+                if Settings.AutoFarmLevel or Settings.FarmSelected or Settings.AutoBoss then
+                    task.wait(1) -- โหมดฟาร์มเก็บให้เองอยู่แล้ว
+                    return
+                end
+                collectNearbyDrops(isAlive)
+                task.wait(0.5)
+            end)
+        else
+            stopLoop("AutoCollect")
+        end
+    end)
+createSliderCard(FarmTab, "Collect Range", 10, 300, Settings.CollectRange, function(val) Settings.CollectRange = val end)
+
+-- สกิลระหว่างต่อสู้: หมุนใช้ตามลำดับในรายการทุก N วินาที (คูลดาวน์/มานาเซิร์ฟเวอร์ควบคุมเอง)
+-- ชื่อสกิลเปลี่ยนตามคัมภีร์ที่สวม ค่าเริ่มต้นเป็นชุด Light ที่เห็นในล็อก แก้เองได้ คั่นด้วยเครื่องหมายจุลภาค
+createCardToggle(FarmTab, "Auto Skills (ตอนต่อสู้)", "ใช้สกิลตามรายการด้านล่างสลับกันไป",
+    Settings.AutoSkill, function(state) Settings.AutoSkill = state end)
+createTextBoxCard(FarmTab, "Skill List (คั่นด้วย , )", Settings.SkillList, function(text)
+    Settings.SkillList = text
+end)
+createSliderCard(FarmTab, "Skill Interval (วินาที)", 1, 10, Settings.SkillInterval, function(val) Settings.SkillInterval = val end)
+
+-- สกิลใช้ได้เมื่อสวมสไตล์ Magic: attribute WK_ActiveCombatStyle บอกสไตล์ปัจจุบัน
+-- และเกมส่ง CombatEquipment("Equip", "Magic") ตอนสลับ (ยืนยันจากล็อก)
+createCardToggle(FarmTab, "Auto Equip Magic Style", "สวมสไตล์ Magic ให้อัตโนมัติถ้ายังไม่ได้สวม",
+    Settings.AutoEquipMagic, function(state)
+        Settings.AutoEquipMagic = state
+        if state then
+            startLoop("AutoEquipMagic", function() return Settings.AutoEquipMagic end, function()
+                if player:GetAttribute("WK_ActiveCombatStyle") ~= "Magic" then
+                    fire(CombatEquipmentRemote, "Equip", "Magic")
+                    fire(SetBookModeRemote, true) -- ล็อกแสดงว่าเกมยิงตามหลัง Equip Magic ทุกครั้ง
+                end
+                task.wait(3)
+            end)
+        else
+            stopLoop("AutoEquipMagic")
+        end
+    end)
+
+createSliderCard(FarmTab, "HP Safety: หนีเมื่อเลือดต่ำกว่า % (0 = ปิด)", 0, 90, Settings.MinHpPercent, function(val) Settings.MinHpPercent = val end)
+
+-- บอสที่อมตะจนกว่าจะเคลียร์มอนรอบตัว (เช่น RadesBoss): ตีมอนที่อยู่ในรัศมีรอบบอสก่อน แล้วค่อยตีบอสเมื่อหมดอมตะ
+createSliderCard(FarmTab, "Boss Adds Radius (รัศมีเคลียร์มอนรอบบอส)", 30, 400, Settings.BossAddRadius, function(val) Settings.BossAddRadius = val end)
+
+-- --- TAB 2: GRIMOIRE ---
+createCardToggle(GrimoireTab, "Auto Spin Grimoire (Gems)", "สุ่มคัมภีร์ผ่านรีโมทเซิร์ฟเวอร์",
+    Settings.AutoSpinGrimoire, function(state)
+        Settings.AutoSpinGrimoire = state
+        if state then
+            startLoop("AutoSpin", function() return Settings.AutoSpinGrimoire end, function()
+                fire(ShopSpinRemote, { Mode = "Gems" })
+                task.wait(1.2 + math.random() * 0.4) -- สุ่มหน่วงเล็กน้อย ไม่ยิงเป็นจังหวะตายตัว
+            end)
+        else
+            stopLoop("AutoSpin")
+        end
+    end)
+
+createSelectorCard(GrimoireTab, "Keep Rarity Minimum", Settings.KeepRarity, function(updateBtn)
+    local options = { "Keep All", "Rare+", "Legendary+", "Mythical Only" }
+    openSelectionModal("Select Minimum Rarity to Keep", options, Settings.KeepRarity, function(chosen)
+        Settings.KeepRarity = chosen
+        updateBtn(chosen)
+        saveConfig()
+    end)
+end)
+
+-- รายชื่อ Grimoire ที่ต้องทิ้ง = ทุก tier ที่ต่ำกว่า tier ขั้นต่ำที่เลือกเก็บ
+local function getDropList()
+    local keepIdx = KeepTierIndex[Settings.KeepRarity]
+    local list = {}
+    if not keepIdx then return list end -- "Keep All"
+    for i = 1, keepIdx - 1 do
+        for _, id in ipairs(RarityTiers[TierOrder[i]]) do
+            table.insert(list, id)
+        end
+    end
+    return list
+end
+
+-- ทิ้งเฉพาะตอนมีเหตุการณ์: เกมส่ง GrimoireRolled (สุ่มได้คัมภีร์) / InventoryFull (คลังเต็ม) มาให้
+-- และมีรอบสำรองทุก 10 วินาที (เดิมยิง remote ทุก 2.5 วินาทีตลอดเวลา)
+local dropRequested = false
+local dropPassRunning = false
+
+for _, evName in ipairs({ "GrimoireRolled", "InventoryFull" }) do
+    local ev = Remotes and Remotes:FindFirstChild(evName)
+    if ev and ev:IsA("RemoteEvent") then
+        track(ev.OnClientEvent:Connect(function()
+            if Settings.AutoDropGrimoire then dropRequested = true end
+        end))
+    end
+end
+
+local function runDropPass(isAlive)
+    if dropPassRunning then return end
+    dropPassRunning = true
+    pcall(function()
+        for _, gId in ipairs(getDropList()) do
+            if not isAlive() then break end
+            fire(DropGrimoireRemote, { Id = gId })
+            task.wait(0.25)
+        end
+    end)
+    dropPassRunning = false
+end
+
+createCardToggle(GrimoireTab, "Auto Drop Unwanted", "ทิ้งคัมภีร์ที่ต่ำกว่าระดับที่เลือก (กันเต็ม 12 ช่อง)",
+    Settings.AutoDropGrimoire, function(state)
+        Settings.AutoDropGrimoire = state
+        if state then
+            dropRequested = true -- เปิดแล้วทิ้งรอบแรกทันที
+            startLoop("AutoDrop", function() return Settings.AutoDropGrimoire end, function(isAlive)
+                local waited = 0
+                while isAlive() and not dropRequested and waited < 10 do
+                    task.wait(0.25)
+                    waited = waited + 0.25
+                end
+                if not isAlive() then return end
+                if dropRequested then task.wait(1.5) end -- ให้เซิร์ฟเวอร์เพิ่มไอเทมเข้าคลังก่อน
+                dropRequested = false
+                runDropPass(isAlive)
+            end)
+        else
+            stopLoop("AutoDrop")
+        end
+    end)
+
+-- --- TAB 3: SHOP & WORLD ---
+createSelectorCard(ShopTab, "Teleport Island", Settings.SelectedIsland, function(updateBtn)
+    openSelectionModal("Select Destination Island", IslandList, Settings.SelectedIsland, function(chosen)
+        Settings.SelectedIsland = chosen
+        updateBtn(chosen)
+        fire(TeleportRemote, chosen)
+        farmState.lastIsland = "" -- วาร์ปเอง -> ให้ Auto Farm ตรวจตำแหน่งใหม่
+        saveConfig()
+    end)
+end)
+
+createSelectorCard(ShopTab, "Select Material to Buy", Settings.SelectedMaterial, function(updateBtn)
+    openSelectionModal("Choose Material", MaterialList, Settings.SelectedMaterial, function(chosen)
+        Settings.SelectedMaterial = chosen
+        updateBtn(chosen)
+        saveConfig()
+    end)
+end)
+
+createSliderCard(ShopTab, "Buy Amount", 1, 50, Settings.BuyAmount, function(val) Settings.BuyAmount = val end)
+
+createCardToggle(ShopTab, "Auto Buy Material", "สั่งซื้อวัตถุดิบผ่านร้านค้าอัตโนมัติ",
+    Settings.AutoBuyMats, function(state)
+        Settings.AutoBuyMats = state
+        if state then
+            -- เกมยิง MaterialShopState แค่ครั้งเดียวตอนเปิดร้าน (ยืนยันจากล็อก) จึงยิงทุก 60 วินาทีพอ
+            local lastShopState = 0
+            startLoop("AutoBuy", function() return Settings.AutoBuyMats end, function()
+                if os.clock() - lastShopState > 60 then
+                    lastShopState = os.clock()
+                    fire(MaterialShopStateRemote)
+                end
+                fire(MaterialShopBuyRemote, Settings.SelectedMaterial, Settings.BuyAmount)
+                task.wait(1.5)
+            end)
+        else
+            stopLoop("AutoBuy")
+        end
+    end)
+
+-- ---------- Debug: ดูข้อมูลที่เซิร์ฟเวอร์ส่งมา (เปิดดูใน F9 Console) ----------
+-- ใช้เรียนรู้รูปแบบข้อมูลของ event ต่างๆ เช่น เควสต์ ร้านค้า รางวัล แล้วนำไปพัฒนาต่อได้
+local DebugEvents = {
+    "QuestUpdated", "QuestCompleted", "GrimoireRolled", "InventoryFull", "MaterialsEarned",
+    "ChestEarned", "Notification", "MaterialShopState", "MeritAwarded", "DailyRewardState",
+    "PlayTimeState", "FreeRewardState", "DungeonState", "StateChanged",
+}
+local debugConns = {}
+
+local function fmtArg(v, depth)
+    depth = depth or 0
+    local t = typeof(v)
+    if t == "table" then
+        if depth >= 3 then return "{...}" end
+        local parts, n = {}, 0
+        for k, val in pairs(v) do
+            n = n + 1
+            if n > 25 then table.insert(parts, "...") break end
+            table.insert(parts, tostring(k) .. "=" .. fmtArg(val, depth + 1))
+        end
+        return "{" .. table.concat(parts, ", ") .. "}"
+    elseif t == "string" then
+        return string.format("%q", v)
+    elseif t == "Instance" then
+        return v:GetFullName()
+    end
+    return tostring(v)
+end
+
+local function setDebugLog(on)
+    for name, conn in pairs(debugConns) do
+        pcall(function() conn:Disconnect() end)
+        debugConns[name] = nil
+    end
+    if not on then return end
+    for _, name in ipairs(DebugEvents) do
+        local ev = Remotes and Remotes:FindFirstChild(name)
+        if ev and ev:IsA("RemoteEvent") then
+            debugConns[name] = track(ev.OnClientEvent:Connect(function(...)
+                local args = table.pack(...)
+                local out = {}
+                for i = 1, args.n do out[i] = fmtArg(args[i]) end
+                print("[LuckyHub] <- " .. name .. "(" .. table.concat(out, ", ") .. ")")
+            end))
+        end
+    end
+end
+
+createCardToggle(ShopTab, "Debug Log (F9)", "แสดงข้อมูล event จากเซิร์ฟเวอร์ใน Console",
+    Settings.DebugLog, function(state)
+        Settings.DebugLog = state
+        setDebugLog(state)
+    end)
+
+-- --- TAB: BOSS (เรียกบอสจากหน้า BossSummonUI แล้วสู้อัตโนมัติ) ---
+-- BossSummon({ Phase = "Spawn", Difficulty = ..., BossId = ... }) รูปแบบยืนยันจากล็อก remote spy
+-- ค่าใช้จ่ายต่อครั้ง (Config.BossSummon): Boss Key + Yul  Easy 1 คีย์, Medium 2, Hard 3, Extreme 5
+local bossSummonCount = 0
+
+local function getSummonCfg(label)
+    for _, b in ipairs(SummonBosses) do
+        if b.label == label then return b end
+    end
+    return nil
+end
+
+-- ตรวจว่ามีบอสตัวนี้อยู่ใน Enemies แล้วหรือยัง (ไม่ต้องรอให้ตัวโหลดเข้ามาใกล้ กันเรียกซ้ำจนเสียกุญแจ)
+local function findSummonedBoss(cfg)
+    if not EnemiesFolder then return nil end
+    for _, v in ipairs(EnemiesFolder:GetChildren()) do
+        if v:IsA("Model") and (v:GetAttribute("EnemyId") == cfg.enemyId or v.Name == cfg.enemyId) then
+            return v
+        end
+    end
+    return nil
+end
+
+local function bossStep(isAlive)
+    local cfg = getSummonCfg(Settings.SummonBoss)
+    if not cfg then task.wait(1) return end
+
+    if Settings.AutoCollect then
+        Status.state = "เก็บดรอป"
+        collectNearbyDrops(isAlive)
+        if not isAlive() then return end
+    end
+
+    -- มีบอสอยู่แล้ว -> สู้ (ไม่เรียกซ้ำ)
+    local existing = findSummonedBoss(cfg)
+    if existing then
+        local enemy, kind = pickTarget(function(v) return v == existing end)
+        if enemy then
+            Status.state = (kind == "add" and "เคลียร์มอนบริวารรอบ " or "ต่อสู้บอส: ") .. cfg.label
+            fightEnemy(enemy, isAlive)
+        else
+            Status.state = (kind == "immune" and "บอสอมตะ รอมอนบริวาร/เปลี่ยนเฟส: " or "รอบอสโหลดเข้ามาใกล้: ") .. cfg.label
+            task.wait(0.5)
+        end
+        task.wait(0.2)
+        return
+    end
+
+    -- ไม่มีบอส -> เรียกใหม่ (ไม่เกินจำนวนสูงสุด)
+    if bossSummonCount >= Settings.MaxSummons then
+        notify("Lucky Hub", "เรียกบอสครบ " .. bossSummonCount .. " ครั้งแล้ว หยุดอัตโนมัติ", 6)
+        bossToggle.Set(false)
+        return
+    end
+    bossSummonCount = bossSummonCount + 1
+    Status.state = "เรียกบอส " .. cfg.label .. " (" .. Settings.SummonDifficulty .. ") ครั้งที่ " .. bossSummonCount
+    fire(BossSummonRemote, { Phase = "Spawn", Difficulty = Settings.SummonDifficulty, BossId = cfg.id })
+
+    local t0 = os.clock()
+    while isAlive() and not findSummonedBoss(cfg) and os.clock() - t0 < 20 do
+        task.wait(0.5)
+    end
+    if isAlive() and not findSummonedBoss(cfg) then
+        -- เรียกแล้วไม่ปรากฏ: กุญแจ/Yul อาจไม่พอ หรืออาจต้องอยู่จุดที่เรียกได้ หยุดทันทีเพื่อไม่ให้เสียของเปล่า
+        notify("Lucky Hub", "เรียกบอสแล้วแต่ไม่ปรากฏใน 20 วินาที (กุญแจ/Yul อาจไม่พอ) หยุดอัตโนมัติ", 8)
+        bossToggle.Set(false)
+    end
+end
+
+local BossInfoLabel = createInfoCard(BossTab, 84)
+BossInfoLabel.Text = "ค่าเรียก 1 ครั้ง = Boss Key + Yul\n"
+    .. "Easy/Medium/Hard/Extreme: 1/2/3/5 คีย์\n"
+    .. "Yami: 2,500 / 7,500 / 15,000 / 35,000 Yul\n"
+    .. "Fuegoleon: 10,000 / 20,000 / 40,000 / 75,000 Yul"
+
+createSelectorCard(BossTab, "Boss", Settings.SummonBoss, function(updateBtn)
+    openSelectionModal("Select Boss", SummonBossLabels, Settings.SummonBoss, function(chosen)
+        Settings.SummonBoss = chosen
+        updateBtn(chosen)
+        saveConfig()
+    end)
+end)
+createSelectorCard(BossTab, "Difficulty", Settings.SummonDifficulty, function(updateBtn)
+    openSelectionModal("Select Difficulty", DifficultyList, Settings.SummonDifficulty, function(chosen)
+        Settings.SummonDifficulty = chosen
+        updateBtn(chosen)
+        saveConfig()
+    end)
+end)
+createSliderCard(BossTab, "Max Summons (จำกัดจำนวนครั้งที่เรียก)", 1, 20, Settings.MaxSummons, function(val) Settings.MaxSummons = val end)
+
+bossToggle = createCardToggle(BossTab, "Auto Summon & Fight Boss", "เรียกบอสแล้วสู้ ใช้ Boss Key + Yul ทุกครั้ง!",
+    false, function(state)
+        Settings.AutoBoss = state
+        if state then
+            if Settings.AutoFarmLevel then
+                Settings.AutoFarmLevel = false
+                stopLoop("AutoFarm")
+                if farmToggle then farmToggle.Set(false) end
+            end
+            if Settings.FarmSelected then
+                Settings.FarmSelected = false
+                stopLoop("FarmSelected")
+                if selectedToggle then selectedToggle.Set(false) end
+            end
+            bossSummonCount = 0
+            startLoop("AutoBoss", function() return Settings.AutoBoss end, bossStep)
+        else
+            stopLoop("AutoBoss")
+        end
+    end)
+
+-- --- TAB: RACE (สุ่มเผ่าไปเรื่อยๆ จนได้เผ่าและระดับที่เลือก) ---
+-- RerollPlayerRace() ไม่มี argument (ยืนยันจากล็อก) แต่ละครั้งใช้ไอเทม K:RaceReroll หนึ่งชิ้น
+-- อ่านเผ่าจาก attribute WK_PlayerRace และระดับ (Stage 1-3) จาก WK_PlayerRaceStage ของผู้เล่น
+do
+    local RerollState = { count = 0, noChange = 0, running = false }
+
+    local function raceNow() return tostring(player:GetAttribute("WK_PlayerRace")) end
+    local function stageNow() return tonumber(player:GetAttribute("WK_PlayerRaceStage")) or 1 end
+
+    local function hasAnyTarget()
+        for _, race in ipairs(RaceList) do
+            if (Settings.RaceTargets[race] or 0) > 0 then return true end
+        end
+        return false
+    end
+
+    -- โอกาสได้เป้าหมายอย่างน้อยหนึ่งอย่างต่อการสุ่ม 1 ครั้ง (ยังไม่รวม Pity)
+    local function targetChance()
+        local p = 0
+        for _, race in ipairs(RaceList) do
+            local level = Settings.RaceTargets[race] or 0
+            if level > 0 then p = p + RaceData[race].odds / 100 * StageAtLeast[level] end
+        end
+        return p
+    end
+
+    local StatusLabel2 = createInfoCard(RaceTab, 74)
+    task.spawn(function()
+        while Runtime.alive do
+            local race, stage = raceNow(), stageNow()
+            local data = RaceData[race]
+            local tierName = data and data.tiers[stage] or "?"
+
+            local goals = {}
+            for _, r in ipairs(RaceList) do
+                local level = Settings.RaceTargets[r] or 0
+                if level > 0 then table.insert(goals, r .. " ★" .. level .. "+") end
+            end
+            local goalText = "ยังไม่ได้เลือก"
+            if #goals > 0 then
+                local p = targetChance()
+                goalText = string.format("%s  (โอกาส ≈ %.1f%%/ครั้ง เฉลี่ย ~%d ครั้ง)",
+                    table.concat(goals, ", "), p * 100, math.ceil(1 / p))
+            end
+            StatusLabel2.Text = string.format(
+                "เผ่าตอนนี้: %s ★%d %s\nเป้าหมาย: %s\nสถานะ: %s",
+                race, stage, tierName, goalText,
+                RerollState.running and string.format("กำลังสุ่ม (ครั้งที่ %d / %d)", RerollState.count, Settings.MaxRerolls) or "หยุดอยู่"
+            )
+            task.wait(1)
+        end
+    end)
+
+    local rerollToggle
+    rerollToggle = createCardToggle(RaceTab, "เริ่มสุ่มเผ่า (สุ่มไปเรื่อยๆ จนได้เป้าหมาย)",
+        "ใช้ไอเทม RaceReroll ทุกครั้ง ย้อนกลับไม่ได้! เลือกเป้าหมายด้านล่างก่อน",
+        false, function(state)
+            Settings.AutoRerollRace = state
+            RerollState.running = state
+            if not state then stopLoop("AutoRerollRace") return end
+
+            if not hasAnyTarget() then
+                notify("Lucky Hub", "ยังไม่ได้เลือกเผ่าที่ต้องการ (กด ★1/★2/★3 ที่การ์ดเผ่าด้านล่าง)", 6)
+                task.defer(function() rerollToggle.Set(false) end)
+                return
+            end
+
+            RerollState.count = 0
+            RerollState.noChange = 0
+            startLoop("AutoRerollRace", function() return Settings.AutoRerollRace end, function(isAlive)
+                if not hasAnyTarget() then
+                    notify("Lucky Hub", "ไม่มีเป้าหมายเหลือแล้ว หยุดสุ่ม", 6)
+                    rerollToggle.Set(false)
+                    return
+                end
+                local race, stage = raceNow(), stageNow()
+                local need = Settings.RaceTargets[race] or 0
+                if need > 0 and stage >= need then
+                    notify("Lucky Hub", "ได้แล้ว! " .. race .. " ★" .. stage .. " (สุ่มไป " .. RerollState.count .. " ครั้ง)", 8)
+                    rerollToggle.Set(false)
+                    return
+                end
+                if RerollState.count >= Settings.MaxRerolls then
+                    notify("Lucky Hub", "สุ่มครบ " .. RerollState.count .. " ครั้งแล้ว หยุดสุ่ม (ตอนนี้: " .. race .. " ★" .. stage .. ")", 8)
+                    rerollToggle.Set(false)
+                    return
+                end
+                if RerollState.noChange >= 15 then
+                    -- ผลเหมือนเดิมติดกัน 15 ครั้ง (โอกาสเกิดตามธรรมชาติต่ำมาก) แปลว่าไอเทมน่าจะหมด
+                    notify("Lucky Hub", "ผลไม่เปลี่ยนติดกัน 15 ครั้ง ไอเทม RaceReroll น่าจะหมด หยุดสุ่ม", 8)
+                    rerollToggle.Set(false)
+                    return
+                end
+
+                RerollState.count = RerollState.count + 1
+                fire(RerollRaceRemote)
+                -- รอให้เผ่าหรือระดับเปลี่ยน (ถ้าได้ผลเดิมหรือของหมด จะรอครบ 4 วินาทีแล้วไปรอบถัดไป)
+                local t0 = os.clock()
+                while isAlive() and raceNow() == race and stageNow() == stage and os.clock() - t0 < 4 do
+                    task.wait(0.2)
+                end
+                if raceNow() == race and stageNow() == stage then
+                    RerollState.noChange = RerollState.noChange + 1
+                else
+                    RerollState.noChange = 0
+                end
+                task.wait(1)
+            end)
+        end)
+
+    for _, race in ipairs(RaceList) do
+        createRaceCard(RaceTab, race)
+    end
+    createSliderCard(RaceTab, "Safety Limit (จำกัดจำนวนครั้ง กันวนไม่จบ)", 10, 500, Settings.MaxRerolls, function(val) Settings.MaxRerolls = val end)
+    local RaceNote = createInfoCard(RaceTab, 44)
+    RaceNote.Text = "Pity (ตีความจาก Config): Devil ครบ 40 ครั้ง, Angel ครบ 75 ครั้ง การันตีเผ่านั้น\nระดับ Stage สุ่มแยก: ★1 70% | ★2 25% | ★3 5%"
+end
+
+-- --- TAB 4: MISC ---
+createCardToggle(MiscTab, "Anti-AFK", "กันโดนเตะเมื่อไม่มี input 20 นาที",
+    Settings.AntiAfk, function(state) Settings.AntiAfk = state end)
+
+-- แจกแต้ม: AssignStatPoint(ชื่อสเตตัส, จำนวน) (ยืนยันจากล็อก; ในล็อกส่งครั้งละ 10)
+createSelectorCard(MiscTab, "Stat to Assign", Settings.StatChoice, function(updateBtn)
+    openSelectionModal("Select Stat", StatList, Settings.StatChoice, function(chosen)
+        Settings.StatChoice = chosen
+        updateBtn(chosen)
+        saveConfig()
+    end)
+end)
+createSliderCard(MiscTab, "Points per Assign", 1, 10, Settings.StatAmount, function(val) Settings.StatAmount = val end)
+createCardToggle(MiscTab, "Auto Assign Stats", "แจกแต้มเข้าสเตตัสที่เลือกอัตโนมัติ",
+    Settings.AutoStats, function(state)
+        Settings.AutoStats = state
+        if state then
+            startLoop("AutoStats", function() return Settings.AutoStats end, function()
+                fire(AssignStatRemote, Settings.StatChoice, Settings.StatAmount)
+                task.wait(3 + math.random() * 0.5)
+            end)
+        else
+            stopLoop("AutoStats")
+        end
+    end)
+
+-- --- เปิดหีบในคลังอัตโนมัติ ---
+-- ChestOpen(ระดับ, จำนวน): ล็อกเห็น (4,5) (3,1) (2,1) (1,1) จึงสรุปว่าตัวแรกคือระดับหีบ 1-4 ตัวที่สองคือจำนวนที่เปิด
+-- ป้ายแจ้งเตือนบนปุ่ม Inventory (ChestBadge) บอกว่ามีหีบให้เปิด ถ้าหาไม่เจอหรือไม่แสดง จะลองเปิดทุก 60 วินาที
+do
+    local badge
+    local function findChestBadge()
+        if badge and badge.Parent then return badge end
+        local hud = playerGui:FindFirstChild("WK_HUD_Safe")
+        if not hud then return nil end
+        for _, d in ipairs(hud:GetDescendants()) do
+            if d:IsA("GuiObject") and string.find(d.Name, "ChestBadge", 1, true) then
+                badge = d
+                return d
+            end
+        end
+        return nil
+    end
+
+    createCardToggle(MiscTab, "Auto Open Chests", "เปิดหีบในคลังทุกระดับ (1-4) อัตโนมัติ",
+        Settings.AutoOpenChests, function(state)
+            Settings.AutoOpenChests = state
+            if state then
+                local lastTry = 0
+                startLoop("AutoOpenChests", function() return Settings.AutoOpenChests end, function(isAlive)
+                    local b = findChestBadge()
+                    local badgeOn = (b ~= nil) and b.Visible
+                    if os.clock() - lastTry > (badgeOn and 8 or 60) then
+                        lastTry = os.clock()
+                        for tier = 4, 1, -1 do
+                            if not isAlive() then return end
+                            fire(ChestOpenRemote, tier, 1)
+                            task.wait(0.6)
+                        end
+                    end
+                    task.wait(2)
+                end)
+            else
+                stopLoop("AutoOpenChests")
+            end
+        end)
+end
+
+-- --- รับรางวัลอัตโนมัติ ---
+-- PlayTimeClaim(เลขการ์ด): ล็อกส่ง 7 ตอนกดการ์ดที่ 7 และหน้ามีการ์ด 1-10 (ยืนยันจากโครงสร้าง UI)
+-- ClaimAssignment("Daily", เลขที่): ล็อกส่ง ("Daily", 6) ส่วน "Weekly" อ้างอิงจากชื่อแท็บย่อย ยังไม่มีล็อกยืนยัน
+-- ช่วงเลขที่ลอง (การ์ด 1-10 และ Assignment 1-8) เป็นการประมาณ ถ้าเกินหรือรับไม่ได้ เซิร์ฟเวอร์จะปฏิเสธเอง
+do
+    local function isClaimed(card)
+        local cf = card and card:FindFirstChild("ClaimedFrame")
+        return cf ~= nil and cf:IsA("GuiObject") and cf.Visible
+    end
+
+    createCardToggle(MiscTab, "Auto Claim Rewards", "รับรางวัลเวลาเล่น + Assignment รายวัน/สัปดาห์ ทุก 2 นาที",
+        Settings.AutoClaimRewards, function(state)
+            Settings.AutoClaimRewards = state
+            if state then
+                startLoop("AutoClaimRewards", function() return Settings.AutoClaimRewards end, function(isAlive)
+                    local rewards = playerGui:FindFirstChild("Rewards")
+                    local container = rewards and rewards:FindFirstChild("Container")
+                    local basePanel = container and container:FindFirstChild("BasePanel")
+                    local pages = basePanel and basePanel:FindFirstChild("Pages")
+                    local playPage = pages and pages:FindFirstChild("Play")
+
+                    for i = 1, 10 do
+                        if not isAlive() then return end
+                        local card = playPage and playPage:FindFirstChild("RewardCard" .. i)
+                        if not isClaimed(card) then -- ข้ามการ์ดที่รับแล้ว (ถ้าตรวจสถานะจาก UI ได้)
+                            fire(PlayTimeClaimRemote, i)
+                            task.wait(0.5)
+                        end
+                    end
+                    for _, category in ipairs({ "Daily", "Weekly" }) do
+                        for i = 1, 8 do
+                            if not isAlive() then return end
+                            fire(ClaimAssignmentRemote, category, i)
+                            task.wait(0.5)
+                        end
+                    end
+                    for _ = 1, 120 do -- พัก 2 นาที เช็กทีละวินาทีเพื่อให้ปิดสวิตช์ได้ทันที
+                        if not isAlive() then return end
+                        task.wait(1)
+                    end
+                end)
+            else
+                stopLoop("AutoClaimRewards")
+            end
+        end)
+end
+
+createButtonCard(MiscTab, "Unload Lucky Hub (ปิดสคริปต์ทั้งหมด)", UITheme.Red, function()
+    if env.LuckyHubCleanup then env.LuckyHubCleanup() end
+end)
+
+-- ==============================================================================
+-- PART 5: Startup notification
+-- ==============================================================================
+
+if #missingRemotes > 0 then
+    notify("Lucky Hub", "ไม่พบ Remote: " .. table.concat(missingRemotes, ", "), 6)
+else
+    notify("Lucky Hub", "Loaded successfully!", 3)
+end
